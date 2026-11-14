@@ -6,9 +6,11 @@ One file, `read_guard.py`. Python 3.9+, standard library only.
 
 ## Why
 
-An unranged `Read` pulls the whole file into context, up to about 25k tokens per call. Claude Code itself only refuses a whole file over 256 KB. Everything between a normal handoff doc and that ceiling goes straight in. read-guard draws the line at 32 KB by default. Across one developer's 14,411 Markdown files (median 2.7 KB, p90 10.6 KB), that let 98% through untouched and caught the 264 files where a whole read costs roughly 8k to 25k tokens.
+An unranged `Read` pulls the whole file into context, up to 25k tokens per call by default, and Claude Code only refuses a whole file over 256 KB ([Claude Code tools reference](https://code.claude.com/docs/en/tools-reference), checked on v2.1.325, 2026-11-14). Everything between a normal handoff doc and that ceiling goes straight in. read-guard draws the line at 32 KB by default. Across the author's 14,411 Markdown files, measured 2026-11-14 (median 2.7 KB, p90 10.6 KB), that let 98% through untouched and caught 264 files. Claude Code would let 258 of those through, at an estimated 8k to 25k tokens per read (about 4 bytes per token).
 
 ## What Claude sees
+
+Example, from a 34 KB test file:
 
 ```
 read-guard: blocked an unranged Read of /work/notes/handoff.md
@@ -110,7 +112,7 @@ Set `READ_GUARD=off` in the environment to disable the guard for a session.
 ## Limits
 
 - Claude Code only. Cowork and chat have no hooks.
-- It covers the band Claude Code lets through today: from 32 KB up to Claude Code's own 256 KB refusal, where each read can cost up to about 25k tokens. It also covers `allow_large` reads, which skip that refusal.
+- It covers the band Claude Code lets through today: from 32 KB up to Claude Code's own 256 KB refusal, where each read can cost up to 25k tokens by default ([tools reference](https://code.claude.com/docs/en/tools-reference), checked on v2.1.325, 2026-11-14). It also covers `allow_large` reads, which skip that refusal.
 - It cannot stop a Bash `cat`, `head` or `sed` of the same file.
 - Files added with `@` in a prompt are attached without a tool call, so they never pass through the hook.
 - Any `limit` counts as ranged, including a very large one.
