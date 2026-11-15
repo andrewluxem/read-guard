@@ -16,7 +16,10 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "read_guard.py")
 EM_DASH = "\u2014"
-CLOSING = "If the whole file is truly needed, read it in ranges and say why."
+
+
+def closing(cap="400"):
+    return "If the whole file is truly needed, read it in ranges of up to %s lines and say why." % cap
 
 
 def write(path, text):
@@ -80,10 +83,12 @@ class HookTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out, "", "expected allow, got %r" % out[:300])
 
-    def assertDenied(self, stdin, **env):
+    def denyReason(self, stdin, **env):
+        """Assert a well-formed deny and return its reason."""
         code, out = self.run_hook(stdin, **env)
         self.assertEqual(code, 0, "deny must exit 0 so Claude Code reads the JSON")
         self.assertNotIn(EM_DASH, out)
+        self.assertNotEqual(out, "", "expected deny, got allow")
         data = json.loads(out)
         self.assertEqual(list(data), ["hookSpecificOutput"])
         hso = data["hookSpecificOutput"]
@@ -91,7 +96,13 @@ class HookTest(unittest.TestCase):
         self.assertEqual(hso["permissionDecision"], "deny")
         reason = hso["permissionDecisionReason"]
         self.assertNotIn(EM_DASH, reason)
-        self.assertEqual(reason.splitlines()[-1], CLOSING)
+        return reason
+
+    def assertDenied(self, stdin, cap="400", **env):
+        """A deny that carries the file map and the line cap."""
+        reason = self.denyReason(stdin, **env)
+        self.assertIn("needs a limit of %s or fewer" % cap, reason)
+        self.assertEqual(reason.splitlines()[-1], closing(cap))
         return reason
 
     def config(self, name, data):
@@ -107,6 +118,64 @@ class HookTest(unittest.TestCase):
         self.assertAllowed(self.payload(self.big_md, limit=40))
         self.assertAllowed(self.payload(self.big_md, offset=200, limit=40))
         self.assertAllowed(self.payload(self.big_md, allow_large=True, limit=40))
+        self.assertAllowed(self.payload(self.big_md, limit=400))
+
+    def test_limit_over_cap_is_denied(self):
+        reason = self.assertDenied(self.payload(self.big_md, limit=401))
+        self.assertIn("read-guard: blocked a Read of %s with limit 401, over the 400-line cap"
+                      % self.big_md, reason)
+        reason = self.assertDenied(self.payload(self.big_md, limit=100000))
+        self.assertIn("with limit 100,000, over the 400-line cap", reason)
+        self.assertIn("over the 32 KB threshold", reason)
+        self.assertIn("  1: # Title", reason)
+        self.assertDenied(self.payload(self.big_md, offset=200, limit=100000))
+        self.assertDenied(self.payload(self.big_md, allow_large=True, limit=100000))
+
+    def test_non_integer_limit_counts_as_missing(self):
+        for bad in ("100000", "40", 40.0, True, None):
+            reason = self.assertDenied(self.payload(self.big_md, limit=bad))
+            self.assertIn("blocked an unranged Read", reason)
+
+    def test_max_lines_config(self):
+        # 10-byte lines: 1,001 of them is about 10 KB, far under the 32 KB
+        # threshold, so only the line cap decides here.
+        log = write(os.path.join(self.proj, "logs", "short.log"), rows(first="row 00000"))
+        cfg = self.config("cfg.json", {"max_lines": 1000})
+        self.assertAllowed(self.payload(log, limit=1000), READ_GUARD_CONFIG=cfg)
+        reason = self.assertDenied(self.payload(log, limit=1001), cap="1,000",
+                                   READ_GUARD_CONFIG=cfg)
+        self.assertIn("over the 1,000-line cap", reason)
+        self.assertDenied(self.payload(log), cap="1,000", READ_GUARD_CONFIG=cfg)
+        # A config without max_lines keeps the default cap.
+        cfg = self.config("old.json", {"threshold_kb": 32})
+        self.assertAllowed(self.payload(log, limit=400), READ_GUARD_CONFIG=cfg)
+        self.assertDenied(self.payload(log, limit=401), READ_GUARD_CONFIG=cfg)
+
+    def test_ranged_read_over_threshold_is_denied(self):
+        # 60 lines of exactly 1 KiB. limit 40 is under the 400-line cap but
+        # asks for 40 KiB, over the 32 KB threshold.
+        kb = write(os.path.join(self.proj, "logs", "kb-lines.log"), ("k" * 1023 + "\n") * 60)
+        reason = self.denyReason(self.payload(kb, limit=40))
+        self.assertIn("read-guard: blocked a ranged Read of %s, lines 1-40\n" % kb, reason)
+        self.assertIn("Range size 40.0 KB (40,960 bytes), over the 32 KB threshold.", reason)
+        self.assertIn("from line 1, a limit of 32 or less stays within the threshold", reason)
+        self.assertAllowed(self.payload(kb, limit=32))
+        reason = self.denyReason(self.payload(kb, offset=20, limit=40))
+        self.assertIn("lines 20-59", reason)
+        self.assertIn("from line 20, a limit of 32 or less", reason)
+        # Only lines that exist count: offset 50 leaves 11 lines, 11 KiB.
+        self.assertAllowed(self.payload(kb, offset=50, limit=40))
+        # A higher max_lines does not lift the byte check.
+        cfg = self.config("cfg.json", {"max_lines": 1000})
+        self.assertIn("blocked a ranged Read",
+                      self.denyReason(self.payload(kb, limit=60), READ_GUARD_CONFIG=cfg))
+        # A single line over the threshold: no limit fits, so point at Grep.
+        one = write(os.path.join(self.proj, "data", "one.json"),
+                    '{"blob": "%s"}\n' % ("x" * (40 * 1024)))
+        reason = self.denyReason(self.payload(one, limit=1))
+        self.assertIn("read-guard: blocked a ranged Read of %s, line 1\n" % one, reason)
+        self.assertIn("no smaller limit fits", reason)
+        self.assertIn("Grep", reason)
 
     def test_offset_only_is_denied(self):
         self.assertDenied(self.payload(self.big_md, offset=300))
@@ -117,6 +186,7 @@ class HookTest(unittest.TestCase):
     def test_small_file_passes(self):
         small = write(os.path.join(self.proj, "small.md"), "# Small\n\nShort.\n")
         self.assertAllowed(self.payload(small))
+        self.assertAllowed(self.payload(small, limit=100000))
 
     def test_big_markdown_denied_with_headings(self):
         reason = self.assertDenied(self.payload(self.big_md))
@@ -139,7 +209,8 @@ class HookTest(unittest.TestCase):
         self.assertIn("  1: boot ok", reason)
         self.assertIn("  5: row 00004", reason)
         self.assertNotIn("  6: ", reason)
-        self.assertIn("Grep for what you need, or Read a range with offset and limit.", reason)
+        self.assertIn("Grep for what you need, or Read a range with offset and limit "
+                      "(limit 400 or less).", reason)
 
     def test_pdf_and_image_ignored(self):
         pdf = write(os.path.join(self.proj, "big.pdf"), "%PDF" + "x" * 70000)
@@ -257,6 +328,9 @@ class HookTest(unittest.TestCase):
         self.assertAllowed(self.payload(self.big_md), READ_GUARD_CONFIG=broken)
         bad = self.config("bad.json", {"watch": "docs/**"})
         self.assertAllowed(self.payload(self.big_md), READ_GUARD_CONFIG=bad)
+        for value in (0, "400", True, 1.5):
+            bad = self.config("badmax.json", {"max_lines": value})
+            self.assertAllowed(self.payload(self.big_md), READ_GUARD_CONFIG=bad)
 
     def test_fenced_code_and_front_matter_are_not_headings(self):
         extra = "```bash\n# install step\n```\n\n"

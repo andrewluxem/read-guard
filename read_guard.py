@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """read-guard: a Claude Code PreToolUse hook for the Read tool.
 
-Denies an unranged Read of a large text file and gives Claude a map of the
-file instead (Markdown headings with line numbers, or the first lines), so it
-can read only the range it needs.
+Denies a Read of a large text file that has no limit, or a limit over the
+line cap, and gives Claude a map of the file instead (Markdown headings with
+line numbers, or the first lines), so it can read only the range it needs.
+A ranged Read whose lines add up to more than the threshold is denied too,
+with the range's byte size and a limit that fits.
 
 Python 3.9+, standard library only. Fails open: if anything unexpected
 happens, the Read goes ahead. Never writes to any settings file.
@@ -20,9 +22,11 @@ import os
 import re
 import sys
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 DEFAULT_THRESHOLD_KB = 32
+# Largest `limit` allowed on a file over the threshold. Config key: max_lines.
+DEFAULT_MAX_LINES = 400
 DEFAULT_WATCH = ("**/*",)
 DEFAULT_EXTENSIONS = (
     ".md", ".markdown", ".txt", ".rst", ".org", ".log",
@@ -100,8 +104,12 @@ def parse_config(data):
     if (isinstance(threshold, bool) or not isinstance(threshold, (int, float))
             or not math.isfinite(threshold) or threshold < 0):
         raise ConfigError("threshold_kb must be a non-negative number")
+    max_lines = data.get("max_lines", DEFAULT_MAX_LINES)
+    if isinstance(max_lines, bool) or not isinstance(max_lines, int) or max_lines < 1:
+        raise ConfigError("max_lines must be a positive integer")
     return {
         "threshold_kb": threshold,
+        "max_lines": max_lines,
         "watch": _str_list(data, "watch", list(DEFAULT_WATCH)),
         "ignore": _str_list(data, "ignore", []),
         "extensions": [_normalize_ext(e) for e in
@@ -282,12 +290,19 @@ def no_em_dash(text):
     return text.replace(EM_DASH, "-")
 
 
-def build_reason(shown_path, path, size, threshold_kb, is_markdown):
+def build_reason(shown_path, path, size, threshold_kb, max_lines, limit, is_markdown):
     line_count, first_lines, headings, heading_total = scan_file(path, is_markdown)
+    cap = format(max_lines, ",")
+    if limit is None:
+        header = "read-guard: blocked an unranged Read of %s" % shown_path
+    else:
+        header = ("read-guard: blocked a Read of %s with limit %s, over the %s-line cap"
+                  % (shown_path, format(limit, ","), cap))
     out = [
-        "read-guard: blocked an unranged Read of %s" % shown_path,
+        header,
         "Size %.1f KB (%s bytes), over the %s KB threshold. %s lines."
         % (size / 1024.0, format(size, ","), _fmt_number(threshold_kb), format(line_count, ",")),
+        "Line cap: a Read of a file over the threshold needs a limit of %s or fewer." % cap,
     ]
     if is_markdown and headings:
         out.append("Headings (line: heading):")
@@ -296,12 +311,58 @@ def build_reason(shown_path, path, size, threshold_kb, is_markdown):
         if more > 0:
             out.append("  ... and %d more: grep for ^# and read that range" % more)
         out.append("Read the section you need: offset at its heading line, "
-                   "limit up to the next heading.")
+                   "limit up to the next heading (%s at most)." % cap)
     else:
         out.append("First %d lines:" % len(first_lines))
         out.extend("  %d: %s" % item for item in first_lines)
-        out.append("Grep for what you need, or Read a range with offset and limit.")
-    out.append("If the whole file is truly needed, read it in ranges and say why.")
+        out.append("Grep for what you need, or Read a range with offset and limit "
+                   "(limit %s or less)." % cap)
+    out.append("If the whole file is truly needed, read it in ranges of up to %s lines "
+               "and say why." % cap)
+    return no_em_dash("\n".join(out))
+
+
+def measure_range(path, start, limit, threshold):
+    """Measure lines start .. start+limit-1 (1-based), line endings included.
+
+    Returns (range_bytes, end_line, first_line_bytes, fit). end_line is the
+    last line actually in the range (start - 1 when the range is past the
+    end of the file); fit is how many lines from `start` stay within
+    `threshold` bytes.
+    """
+    range_bytes, end_line, first_line_bytes, fit = 0, start - 1, 0, 0
+    stop = start + limit
+    with open(path, "rb") as fh:
+        for number, raw in enumerate(fh, 1):
+            if number < start:
+                continue
+            if number >= stop:
+                break
+            range_bytes += len(raw)
+            end_line = number
+            if number == start:
+                first_line_bytes = len(raw)
+            if range_bytes <= threshold:
+                fit += 1
+    return range_bytes, end_line, first_line_bytes, fit
+
+
+def build_range_reason(shown_path, start, end, range_bytes, first_line_bytes, fit,
+                       threshold_kb):
+    first = format(start, ",")
+    lines = ("line %s" % first) if end == start else ("lines %s-%s" % (first, format(end, ",")))
+    out = [
+        "read-guard: blocked a ranged Read of %s, %s" % (shown_path, lines),
+        "Range size %.1f KB (%s bytes), over the %s KB threshold."
+        % (range_bytes / 1024.0, format(range_bytes, ","), _fmt_number(threshold_kb)),
+    ]
+    if fit:
+        out.append("Use a smaller limit: from line %s, a limit of %s or less stays within "
+                   "the threshold." % (first, format(fit, ",")))
+        out.append("If the whole range is truly needed, read it in smaller ranges and say why.")
+    else:
+        out.append("Line %s alone is %.1f KB, over the threshold, so no smaller limit fits. "
+                   "Grep for what you need instead." % (first, first_line_bytes / 1024.0))
     return no_em_dash("\n".join(out))
 
 
@@ -318,10 +379,12 @@ def evaluate(raw, env):
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
         return None
-    # Ranged means `limit` is present. offset alone, or allow_large alone,
-    # is still a read to the end of the file.
-    if tool_input.get("limit") is not None:
-        return None
+    # offset alone, or allow_large alone, is still a read to the end of the
+    # file, so only `limit` makes a Read ranged. A limit that is not an
+    # integer counts as missing.
+    limit = tool_input.get("limit")
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        limit = None
     file_path = tool_input.get("file_path")
     if not isinstance(file_path, str) or not file_path:
         return None
@@ -350,11 +413,24 @@ def evaluate(raw, env):
         return None
 
     size = os.path.getsize(path)
-    if size <= config["threshold_kb"] * 1024:
+    threshold = config["threshold_kb"] * 1024
+    if size <= threshold:
         return None
-
-    reason = build_reason(file_path, path, size, config["threshold_kb"],
-                          ext in MARKDOWN_EXTENSIONS)
+    if limit is not None and limit <= config["max_lines"]:
+        # Under the line cap a range can still be huge when its lines are
+        # long, so measure the bytes of the requested lines too. Read's
+        # offset is a 1-based line number; missing or below 1 means line 1.
+        offset = tool_input.get("offset")
+        start = offset if (isinstance(offset, int) and not isinstance(offset, bool)
+                           and offset > 1) else 1
+        range_bytes, end, first_bytes, fit = measure_range(path, start, limit, threshold)
+        if range_bytes <= threshold:
+            return None
+        reason = build_range_reason(file_path, start, end, range_bytes, first_bytes, fit,
+                                    config["threshold_kb"])
+    else:
+        reason = build_reason(file_path, path, size, config["threshold_kb"],
+                              config["max_lines"], limit, ext in MARKDOWN_EXTENSIONS)
     return {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -458,6 +534,30 @@ def _selftest_cases(tmp):
     def c_limit():
         allow(handle(_payload(big_md, limit=50), env))
         allow(handle(_payload(big_md, offset=10, limit=50), env))
+        allow(handle(_payload(big_md, limit=DEFAULT_MAX_LINES), env))
+
+    def c_limit_over_cap():
+        reason = _deny_reason(handle(_payload(big_md, limit=DEFAULT_MAX_LINES + 1), env))
+        assert "with limit 401, over the 400-line cap" in reason, reason[:300]
+        reason = _deny_reason(handle(_payload(big_md, offset=10, limit=100000), env))
+        assert "with limit 100,000, over the 400-line cap" in reason, reason[:300]
+        assert "  1: # Title" in reason, "outline missing on over-cap deny"
+        _deny_reason(handle(_payload(big_md, allow_large=True, limit=100000), env))
+
+    def c_non_integer_limit():
+        for bad in ("100000", "40", 40.0, True, [40], {"n": 40}):
+            reason = _deny_reason(handle(_payload(big_md, limit=bad), env))
+            assert "blocked an unranged Read" in reason, "limit %r: %s" % (bad, reason[:200])
+
+    def c_max_lines_config():
+        cfg = _write(os.path.join(tmp, "cfg-max.json"), json.dumps({"max_lines": 1000}))
+        e = dict(env, READ_GUARD_CONFIG=cfg)
+        # big_log has short lines: 1,000 of them stay under the byte threshold,
+        # so this exercises the line cap alone.
+        allow(handle(_payload(big_log, limit=1000), e))
+        reason = _deny_reason(handle(_payload(big_log, limit=1001), e))
+        assert "over the 1,000-line cap" in reason, reason[:300]
+        assert "needs a limit of 1,000 or fewer" in reason, reason[:400]
 
     def c_offset_only():
         _deny_reason(handle(_payload(big_md, offset=100), env))
@@ -467,16 +567,18 @@ def _selftest_cases(tmp):
 
     def c_small():
         allow(handle(_payload(small_md), env))
+        allow(handle(_payload(small_md, limit=100000), env))
 
     def c_big_markdown():
         reason = _deny_reason(handle(_payload(big_md), env))
         assert big_md in reason, "path missing"
         assert "32 KB threshold" in reason, "threshold missing"
         assert " lines." in reason, "line count missing"
+        assert "needs a limit of 400 or fewer" in reason, "line cap missing"
         assert "  1: # Title" in reason, "first heading missing"
         assert "## Section 5" in reason, "later heading missing"
-        assert reason.splitlines()[-1] == \
-            "If the whole file is truly needed, read it in ranges and say why.", "closing line"
+        assert reason.splitlines()[-1] == ("If the whole file is truly needed, read it in "
+                                           "ranges of up to 400 lines and say why."), "closing line"
 
     def c_code_fence_is_not_heading():
         p = _write(os.path.join(proj, "docs", "fenced.md"),
@@ -534,6 +636,9 @@ def _selftest_cases(tmp):
         allow(handle(_payload(big_md), dict(env, READ_GUARD_CONFIG=cfg)))
         cfg = _write(os.path.join(tmp, "cfg-badtype.json"), json.dumps({"threshold_kb": "big"}))
         allow(handle(_payload(big_md), dict(env, READ_GUARD_CONFIG=cfg)))
+        for bad in (0, -5, "400", True, 1.5):
+            cfg = _write(os.path.join(tmp, "cfg-badmax.json"), json.dumps({"max_lines": bad}))
+            allow(handle(_payload(big_md), dict(env, READ_GUARD_CONFIG=cfg)))
 
     def c_threshold_boundary():
         p = _write(os.path.join(proj, "docs", "edge.md"), "# Edge\n" + "a" * (32 * 1024 - 7))
@@ -586,12 +691,37 @@ def _selftest_cases(tmp):
             assert EM_DASH not in _deny_reason(out), "em dash in reason"
         assert "Plan - phase two" in _deny_reason(handle(_payload(md), env))
 
+    def c_range_bytes():
+        # 60 lines of exactly 1 KB: 40 of them is 40 KB, over the 32 KB threshold.
+        kb = _write(os.path.join(proj, "logs", "kb-lines.log"), ("k" * 1023 + "\n") * 60)
+        reason = _deny_reason(handle(_payload(kb, limit=40), env))
+        assert "blocked a ranged Read of %s, lines 1-40\n" % kb in reason, reason[:300]
+        assert "Range size 40.0 KB (40,960 bytes), over the 32 KB threshold." in reason, reason
+        assert "from line 1, a limit of 32 or less" in reason, reason
+        allow(handle(_payload(kb, limit=32), env))
+        allow(handle(_payload(kb, offset=0, limit=32), env))
+        reason = _deny_reason(handle(_payload(kb, offset=20, limit=40), env))
+        assert "lines 20-59" in reason and "from line 20, a limit of 32" in reason, reason
+        allow(handle(_payload(kb, offset=50, limit=40), env))
+        # One line over the threshold: no limit fits, so point at Grep.
+        one = _write(os.path.join(proj, "data", "one.json"),
+                     '{"blob": "%s"}\n' % ("x" * (40 * 1024)))
+        reason = _deny_reason(handle(_payload(one, limit=1), env))
+        assert "blocked a ranged Read of %s, line 1\n" % one in reason, reason
+        assert "no smaller limit fits" in reason and "Grep" in reason, reason
+        # Short lines under the cap still pass.
+        allow(handle(_payload(big_md, offset=10, limit=50), env))
+
     return [
         ("non-Read tool passes", c_non_read),
-        ("Read with limit passes", c_limit),
+        ("Read with limit at or under the cap passes", c_limit),
+        ("Read with limit over the cap is denied", c_limit_over_cap),
+        ("non-integer limit counts as missing", c_non_integer_limit),
+        ("max_lines from config sets the cap", c_max_lines_config),
+        ("ranged Read over the byte threshold is denied", c_range_bytes),
         ("offset only on a big file is denied", c_offset_only),
         ("allow_large without limit is denied", c_allow_large),
-        ("small file passes", c_small),
+        ("small file passes, with or without a huge limit", c_small),
         ("big Markdown denied with headings, valid deny JSON", c_big_markdown),
         ("code fence comment is not a heading", c_code_fence_is_not_heading),
         ("big file with no headings denied with first lines", c_no_headings),

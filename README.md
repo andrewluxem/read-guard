@@ -1,6 +1,6 @@
 # read-guard
 
-A Claude Code `PreToolUse` hook for the `Read` tool. When Claude tries to read a large text file whole, read-guard denies the call and hands back a map of the file: Markdown headings with line numbers, or the first lines of anything else. Claude then reads only the range it needs.
+A Claude Code `PreToolUse` hook for the `Read` tool. When Claude tries to read a large text file whole, or with a `limit` over the line cap, read-guard denies the call and hands back a map of the file: Markdown headings with line numbers, or the first lines of anything else. Claude then reads only the range it needs.
 
 One file, `read_guard.py`. Python 3.9+, standard library only.
 
@@ -15,15 +15,18 @@ Example, from a 34 KB test file:
 ```
 read-guard: blocked an unranged Read of /work/notes/handoff.md
 Size 34.1 KB (34,880 bytes), over the 32 KB threshold. 893 lines.
+Line cap: a Read of a file over the threshold needs a limit of 400 or fewer.
 Headings (line: heading):
   4: # Sample handoff
   6: ## Part 1
   14: ### Detail
   117: ## Part 2
   ...
-Read the section you need: offset at its heading line, limit up to the next heading.
-If the whole file is truly needed, read it in ranges and say why.
+Read the section you need: offset at its heading line, limit up to the next heading (400 at most).
+If the whole file is truly needed, read it in ranges of up to 400 lines and say why.
 ```
+
+A Read with a limit over the cap gets the same map under a different first line: `read-guard: blocked a Read of /work/notes/handoff.md with limit 100,000, over the 400-line cap`.
 
 Headings are capped at 40, then `... and N more: grep for ^# and read that range`. Headings inside fenced code blocks and YAML front matter are skipped. Files without headings get their first 5 lines and a hint to grep or read a range.
 
@@ -70,12 +73,12 @@ read-guard never writes to any settings file. There is no installer.
 The hook reads the PreToolUse payload from stdin and, in order:
 
 1. Allows anything that is not `Read`.
-2. Allows a ranged read, meaning `tool_input` has `limit`. `offset` alone still reads to the end of the file, and so does `allow_large: true`, so both count as unranged.
-3. Allows a path that is missing, not a regular file, or unreadable.
-4. Allows extensions outside the text list. PDFs and images are never guarded, even if you list them.
-5. Allows a path that matches an `ignore` glob, or does not match any `watch` glob.
-6. Allows a file at or under `threshold_kb`.
-7. Otherwise prints a JSON `permissionDecision: "deny"` with the reason above and exits 0. Claude Code shows the reason to Claude.
+2. Allows a path that is missing, not a regular file, or unreadable.
+3. Allows extensions outside the text list. PDFs and images are never guarded, even if you list them.
+4. Allows a path that matches an `ignore` glob, or does not match any `watch` glob.
+5. Allows a file at or under `threshold_kb`, whatever its `limit`.
+6. Allows a ranged read that passes two checks. Line cap: `tool_input` has an integer `limit` of `max_lines` or less. Range size: the lines it asks for, from `offset` (or line 1) for `limit` lines, add up to `threshold_kb` or less, so a few very long lines cannot slip through under the cap. `offset` alone still reads to the end of the file, and so does `allow_large: true`, so both count as unranged. A `limit` that is not an integer counts as missing.
+7. Otherwise (no `limit`, a `limit` over `max_lines`, or a range over `threshold_kb`) prints a JSON `permissionDecision: "deny"` with the reason above and exits 0. Claude Code shows the reason to Claude.
 8. On anything unexpected (bad JSON, a broken config, an exception) it exits 0 and prints nothing. A guard that cannot run must not stop work.
 
 ## Config
@@ -92,6 +95,7 @@ The project root is `$CLAUDE_PROJECT_DIR`, else the session's working directory.
 ```json
 {
   "threshold_kb": 32,
+  "max_lines": 400,
   "watch": ["**/*"],
   "ignore": ["**/node_modules/**", "./CHANGELOG.md"],
   "extensions": [".md", ".markdown", ".txt", ".rst", ".org", ".log", ".csv", ".tsv", ".json", ".yaml", ".yml"]
@@ -101,6 +105,7 @@ The project root is `$CLAUDE_PROJECT_DIR`, else the session's working directory.
 | Key | Default | Meaning |
 |---|---|---|
 | `threshold_kb` | `32` | Files larger than this many KiB are guarded. |
+| `max_lines` | `400` | Largest `limit` allowed on a guarded file. Must be a positive integer. |
 | `watch` | `["**/*"]` | Only paths matching one of these globs are guarded. |
 | `ignore` | `[]` | Paths matching any of these are never guarded. Wins over `watch`. |
 | `extensions` | the list above | Text extensions to guard. Replaces the default list. |
@@ -115,7 +120,7 @@ Set `READ_GUARD=off` in the environment to disable the guard for a session.
 - It covers the band Claude Code lets through today: from 32 KB up to Claude Code's own 256 KB refusal, where each read can cost up to 25k tokens by default ([tools reference](https://code.claude.com/docs/en/tools-reference), checked on v2.1.325, 2026-11-14). It also covers `allow_large` reads, which skip that refusal.
 - It cannot stop a Bash `cat`, `head` or `sed` of the same file.
 - Files added with `@` in a prompt are attached without a tool call, so they never pass through the hook.
-- Any `limit` counts as ranged, including a very large one.
+- It caps each Read, not the total. Many Reads of `max_lines` each can still walk a whole file.
 
 ## Tests
 
