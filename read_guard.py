@@ -5,7 +5,8 @@ Denies a Read of a large text file that has no limit, or a limit over the
 line cap, and gives Claude a map of the file instead (Markdown headings with
 line numbers, or the first lines), so it can read only the range it needs.
 A ranged Read whose lines add up to more than the threshold is denied too,
-with the range's byte size and a limit that fits.
+with the range's byte size, a limit that fits (or, when one line alone is
+too big, a bounded grep or jq hint), and the same map.
 
 Python 3.9+, standard library only. Fails open: if anything unexpected
 happens, the Read goes ahead. Never writes to any settings file.
@@ -20,6 +21,7 @@ import json
 import math
 import os
 import re
+import shlex
 import sys
 
 __version__ = "0.2.0"
@@ -290,19 +292,15 @@ def no_em_dash(text):
     return text.replace(EM_DASH, "-")
 
 
-def build_reason(shown_path, path, size, threshold_kb, max_lines, limit, is_markdown):
+def file_map(path, size, threshold_kb, max_lines, is_markdown):
+    """The file map every deny carries: size and line count, the line cap,
+    then Markdown headings or the first lines. Returns (lines, by_headings)."""
     line_count, first_lines, headings, heading_total = scan_file(path, is_markdown)
-    cap = format(max_lines, ",")
-    if limit is None:
-        header = "read-guard: blocked an unranged Read of %s" % shown_path
-    else:
-        header = ("read-guard: blocked a Read of %s with limit %s, over the %s-line cap"
-                  % (shown_path, format(limit, ","), cap))
     out = [
-        header,
         "Size %.1f KB (%s bytes), over the %s KB threshold. %s lines."
         % (size / 1024.0, format(size, ","), _fmt_number(threshold_kb), format(line_count, ",")),
-        "Line cap: a Read of a file over the threshold needs a limit of %s or fewer." % cap,
+        "Line cap: a Read of a file over the threshold needs a limit of %s or fewer."
+        % format(max_lines, ","),
     ]
     if is_markdown and headings:
         out.append("Headings (line: heading):")
@@ -310,11 +308,25 @@ def build_reason(shown_path, path, size, threshold_kb, max_lines, limit, is_mark
         more = heading_total - len(headings)
         if more > 0:
             out.append("  ... and %d more: grep for ^# and read that range" % more)
+        return out, True
+    out.append("First %d lines:" % len(first_lines))
+    out.extend("  %d: %s" % item for item in first_lines)
+    return out, False
+
+
+def build_reason(shown_path, path, size, threshold_kb, max_lines, limit, is_markdown):
+    cap = format(max_lines, ",")
+    if limit is None:
+        header = "read-guard: blocked an unranged Read of %s" % shown_path
+    else:
+        header = ("read-guard: blocked a Read of %s with limit %s, over the %s-line cap"
+                  % (shown_path, format(limit, ","), cap))
+    map_lines, by_headings = file_map(path, size, threshold_kb, max_lines, is_markdown)
+    out = [header] + map_lines
+    if by_headings:
         out.append("Read the section you need: offset at its heading line, "
                    "limit up to the next heading (%s at most)." % cap)
     else:
-        out.append("First %d lines:" % len(first_lines))
-        out.extend("  %d: %s" % item for item in first_lines)
         out.append("Grep for what you need, or Read a range with offset and limit "
                    "(limit %s or less)." % cap)
     out.append("If the whole file is truly needed, read it in ranges of up to %s lines "
@@ -347,8 +359,8 @@ def measure_range(path, start, limit, threshold):
     return range_bytes, end_line, first_line_bytes, fit
 
 
-def build_range_reason(shown_path, start, end, range_bytes, first_line_bytes, fit,
-                       threshold_kb):
+def build_range_reason(shown_path, path, size, start, end, range_bytes, first_line_bytes, fit,
+                       threshold_kb, max_lines, is_markdown, is_json):
     first = format(start, ",")
     lines = ("line %s" % first) if end == start else ("lines %s-%s" % (first, format(end, ",")))
     out = [
@@ -359,10 +371,24 @@ def build_range_reason(shown_path, start, end, range_bytes, first_line_bytes, fi
     if fit:
         out.append("Use a smaller limit: from line %s, a limit of %s or less stays within "
                    "the threshold." % (first, format(fit, ",")))
+    else:
+        out.append("Line %s alone is %.1f KB, over the threshold, so no smaller limit fits."
+                   % (first, first_line_bytes / 1024.0))
+    out.extend(file_map(path, size, threshold_kb, max_lines, is_markdown)[0])
+    if fit:
         out.append("If the whole range is truly needed, read it in smaller ranges and say why.")
     else:
-        out.append("Line %s alone is %.1f KB, over the threshold, so no smaller limit fits. "
-                   "Grep for what you need instead." % (first, first_line_bytes / 1024.0))
+        # Any tool that prints whole lines would put the giant line into
+        # context, so the hint only offers bounded output.
+        quoted = shlex.quote(shown_path)
+        out.append("Search it with a bounded match that prints at most 80 characters either "
+                   "side of each hit (replace TERM): grep -noE '.{0,80}TERM.{0,80}' %s "
+                   "| head -n 20" % quoted)
+        if is_json:
+            out.append("For a .json file, jq can pull out only the part you need, e.g. "
+                       "jq -c 'keys[:20]' %s | head -c 4000" % quoted)
+        out.append("Never print the whole line: no cat, sed, head -n, or grep without -o "
+                   "on this file.")
     return no_em_dash("\n".join(out))
 
 
@@ -426,8 +452,10 @@ def evaluate(raw, env):
         range_bytes, end, first_bytes, fit = measure_range(path, start, limit, threshold)
         if range_bytes <= threshold:
             return None
-        reason = build_range_reason(file_path, start, end, range_bytes, first_bytes, fit,
-                                    config["threshold_kb"])
+        reason = build_range_reason(file_path, path, size, start, end, range_bytes,
+                                    first_bytes, fit, config["threshold_kb"],
+                                    config["max_lines"], ext in MARKDOWN_EXTENSIONS,
+                                    ext == ".json")
     else:
         reason = build_reason(file_path, path, size, config["threshold_kb"],
                               config["max_lines"], limit, ext in MARKDOWN_EXTENSIONS)
@@ -703,14 +731,39 @@ def _selftest_cases(tmp):
         reason = _deny_reason(handle(_payload(kb, offset=20, limit=40), env))
         assert "lines 20-59" in reason and "from line 20, a limit of 32" in reason, reason
         allow(handle(_payload(kb, offset=50, limit=40), env))
-        # One line over the threshold: no limit fits, so point at Grep.
+        assert "needs a limit of 400 or fewer" in reason and "First 5 lines:" in reason, reason
+        # One line over the threshold: no limit fits, so point at a bounded grep.
         one = _write(os.path.join(proj, "data", "one.json"),
                      '{"blob": "%s"}\n' % ("x" * (40 * 1024)))
         reason = _deny_reason(handle(_payload(one, limit=1), env))
         assert "blocked a ranged Read of %s, line 1\n" % one in reason, reason
-        assert "no smaller limit fits" in reason and "Grep" in reason, reason
+        assert "no smaller limit fits" in reason and "grep -noE" in reason, reason
         # Short lines under the cap still pass.
         allow(handle(_payload(big_md, offset=10, limit=50), env))
+
+    def c_range_one_long_line():
+        line = '{"note": "export %s raw", "blob": "%s"}\n' % (EM_DASH, "x" * (40 * 1024))
+        p = _write(os.path.join(proj, "data", "long.json"), line)
+        for limit in (1, DEFAULT_MAX_LINES):
+            out = handle(_payload(p, limit=limit), env)
+            assert EM_DASH not in out, "em dash in raw output"
+            reason = _deny_reason(out)
+            assert EM_DASH not in reason, "em dash in reason"
+            assert reason.startswith("read-guard: blocked a ranged Read of %s, line 1\n" % p), reason
+            assert "Line 1 alone is 40.0 KB, over the threshold, so no smaller limit fits." \
+                in reason, reason
+            # The file map: size, line count, line cap, first lines.
+            assert "over the 32 KB threshold. 1 lines." in reason, reason
+            assert "Line cap: a Read of a file over the threshold needs a limit of 400 or fewer." \
+                in reason, reason
+            assert 'First 1 lines:\n  1: {"note": "export - raw", "blob": "xxx' in reason, reason
+            # The bounded hint, never a whole-line search.
+            assert "grep -noE '.{0,80}TERM.{0,80}' %s | head -n 20" % shlex.quote(p) in reason, reason
+            assert "jq -c 'keys[:20]'" in reason and "Never print the whole line" in reason, reason
+            assert "Grep for what you need instead" not in reason, reason
+        log = _write(os.path.join(proj, "logs", "long.log"), "z" * (40 * 1024) + "\n")
+        reason = _deny_reason(handle(_payload(log, limit=1), env))
+        assert "grep -noE" in reason and "jq -c" not in reason, reason
 
     return [
         ("non-Read tool passes", c_non_read),
@@ -719,6 +772,7 @@ def _selftest_cases(tmp):
         ("non-integer limit counts as missing", c_non_integer_limit),
         ("max_lines from config sets the cap", c_max_lines_config),
         ("ranged Read over the byte threshold is denied", c_range_bytes),
+        ("one long line: map and bounded grep hint, no em dash", c_range_one_long_line),
         ("offset only on a big file is denied", c_offset_only),
         ("allow_large without limit is denied", c_allow_large),
         ("small file passes, with or without a huge limit", c_small),

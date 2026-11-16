@@ -28,6 +28,23 @@ If the whole file is truly needed, read it in ranges of up to 400 lines and say 
 
 A Read with a limit over the cap gets the same map under a different first line: `read-guard: blocked a Read of /work/notes/handoff.md with limit 100,000, over the 400-line cap`.
 
+A ranged Read whose lines add up to more than the threshold is denied with the range's size and the largest `limit` that fits, then the same map. When one line alone is over the threshold, no `limit` fits, so the hint offers only bounded output. Example, from a 67 KB one-line JSON test file:
+
+```
+read-guard: blocked a ranged Read of /work/data/store.json, line 1
+Range size 66.6 KB (68,206 bytes), over the 32 KB threshold.
+Line 1 alone is 66.6 KB, over the threshold, so no smaller limit fits.
+Size 66.6 KB (68,206 bytes), over the 32 KB threshold. 1 lines.
+Line cap: a Read of a file over the threshold needs a limit of 400 or fewer.
+First 1 lines:
+  1: {"version":3,"entries":[{"id":0,"title":"Item 0","body":"lorem ipsum lorem ipsum lorem ipsum "},{"id":1,"title":"Item 1","body":"lorem ipsum lorem ipsum lore...
+Search it with a bounded match that prints at most 80 characters either side of each hit (replace TERM): grep -noE '.{0,80}TERM.{0,80}' /work/data/store.json | head -n 20
+For a .json file, jq can pull out only the part you need, e.g. jq -c 'keys[:20]' /work/data/store.json | head -c 4000
+Never print the whole line: no cat, sed, head -n, or grep without -o on this file.
+```
+
+The `jq` line appears only for `.json` files.
+
 Headings are capped at 40, then `... and N more: grep for ^# and read that range`. Headings inside fenced code blocks and YAML front matter are skipped. Files without headings get their first 5 lines and a hint to grep or read a range.
 
 ## Install
