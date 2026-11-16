@@ -34,9 +34,9 @@ A ranged Read whose lines add up to more than the threshold is denied with the r
 read-guard: blocked a ranged Read of /work/data/store.json, line 1
 Range size 66.6 KB (68,206 bytes), over the 32 KB threshold.
 Line 1 alone is 66.6 KB, over the threshold, so no smaller limit fits.
-Size 66.6 KB (68,206 bytes), over the 32 KB threshold. 1 lines.
+Size 66.6 KB (68,206 bytes), over the 32 KB threshold. 1 line.
 Line cap: a Read of a file over the threshold needs a limit of 400 or fewer.
-First 1 lines:
+First line:
   1: {"version":3,"entries":[{"id":0,"title":"Item 0","body":"lorem ipsum lorem ipsum lorem ipsum "},{"id":1,"title":"Item 1","body":"lorem ipsum lorem ipsum lore...
 Search it with a bounded match that prints at most 80 characters either side of each hit (replace TERM): grep -noE '.{0,80}TERM.{0,80}' /work/data/store.json | head -n 20
 For a .json file, jq can pull out only the part you need, e.g. jq -c 'keys[:20]' /work/data/store.json | head -c 4000
@@ -45,7 +45,9 @@ Never print the whole line: no cat, sed, head -n, or grep without -o on this fil
 
 The `jq` line appears only for `.json` files.
 
-Headings are capped at 40, then `... and N more: grep for ^# and read that range`. Headings inside fenced code blocks and YAML front matter are skipped. Files without headings get their first 5 lines and a hint to grep or read a range.
+An unranged or over-cap Read of a file with any line over the threshold gets the same bounded hint in place of the grep-or-range hint, after a line naming the longest one (`Line 1 is 66.6 KB, over the threshold, so no Read can include it.`). The closing read-in-ranges line is left out, since no range that holds that line can pass. Markdown files with headings keep their section hint as well.
+
+Headings are capped at 40, then `... and N more: grep for ^# and read that range`. Headings inside fenced code blocks and YAML front matter are skipped. Files without headings get their first 5 lines and a hint to grep or read a range, or the bounded hint when a line is over the threshold.
 
 ## Install
 

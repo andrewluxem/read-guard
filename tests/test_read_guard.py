@@ -197,10 +197,10 @@ class HookTest(unittest.TestCase):
                                        "so no smaller limit fits.")
             # Then the same file map an unranged deny gives.
             self.assertEqual(lines[3], "Size 40.0 KB (40,999 bytes), over the 32 KB threshold. "
-                                       "1 lines.")
+                                       "1 line.")
             self.assertEqual(lines[4], "Line cap: a Read of a file over the threshold needs a "
                                        "limit of 400 or fewer.")
-            self.assertEqual(lines[5], "First 1 lines:")
+            self.assertEqual(lines[5], "First line:")
             self.assertTrue(lines[6].startswith('  1: {"note": "export - raw", "blob": "xxx'))
             self.assertLessEqual(len(lines[6]), 5 + 160)
             # Then a hint that cannot print the giant line.
@@ -213,6 +213,59 @@ class HookTest(unittest.TestCase):
         reason = self.denyReason(self.payload(log, limit=1))
         self.assertIn("grep -noE", reason)
         self.assertNotIn("jq -c", reason)
+
+    def test_unranged_one_long_line_json_and_log(self):
+        js = write(os.path.join(self.proj, "data", "giant.json"),
+                   '{"note": "export %s raw", "blob": "%s"}\n' % (EM_DASH, "x" * (40 * 1024)))
+        log = write(os.path.join(self.proj, "logs", "giant.log"),
+                    "boot %s ok " % EM_DASH + "z" * (40 * 1024) + "\n")
+        for p, is_json, size in ((js, True, "40,999"), (log, False, "40,973")):
+            for kw, header in (({}, "read-guard: blocked an unranged Read of %s" % p),
+                               ({"limit": 100000}, "read-guard: blocked a Read of %s with "
+                                                   "limit 100,000, over the 400-line cap" % p)):
+                code, out = self.run_hook(self.payload(p, **kw))
+                self.assertEqual(code, 0)
+                self.assertNotIn(EM_DASH, out)
+                reason = self.denyReason(self.payload(p, **kw))
+                self.assertNotIn(EM_DASH, reason)
+                lines = reason.splitlines()
+                # The map, with singular grammar for a one-line file.
+                self.assertEqual(lines[0], header)
+                self.assertEqual(lines[1], "Size 40.0 KB (%s bytes), over the 32 KB threshold. "
+                                           "1 line." % size)
+                self.assertEqual(lines[2], "Line cap: a Read of a file over the threshold "
+                                           "needs a limit of 400 or fewer.")
+                self.assertEqual(lines[3], "First line:")
+                self.assertTrue(lines[4].startswith("  1: "))
+                self.assertLessEqual(len(lines[4]), 5 + 160)
+                self.assertIn(" - ", lines[4])
+                # Then the bounded hint instead of grep-or-range.
+                self.assertEqual(lines[5], "Line 1 is 40.0 KB, over the threshold, so no Read "
+                                           "can include it.")
+                self.assertEqual(lines[6], "Search it with a bounded match that prints at most "
+                                           "80 characters either side of each hit (replace "
+                                           "TERM): grep -noE '.{0,80}TERM.{0,80}' %s | head -n 20"
+                                 % shlex.quote(p))
+                if is_json:
+                    self.assertTrue(lines[7].startswith("For a .json file, jq can pull out"))
+                self.assertNotEqual(is_json, all("jq -c" not in ln for ln in lines))
+                self.assertEqual(lines[-1], "Never print the whole line: no cat, sed, head -n, "
+                                            "or grep without -o on this file.")
+                self.assertNotIn("Grep for what you need, or Read a range", reason)
+                self.assertNotIn("If the whole file is truly needed", reason)
+
+    def test_giant_line_found_across_chunks(self):
+        # A 100 KiB line that straddles the hook's 64 KiB first chunk, line 3 of 4.
+        p = write(os.path.join(self.proj, "logs", "cross.log"),
+                  "a\nb\n" + "z" * (100 * 1024 - 1) + "\nc\n")
+        reason = self.denyReason(self.payload(p))
+        self.assertIn("4 lines.", reason)
+        self.assertIn("Line 3 is 100.0 KB, over the threshold, so no Read can include it.", reason)
+        # A file whose lines are all short keeps the grep-or-range hint.
+        rows_log = write(os.path.join(self.proj, "logs", "rows.log"), rows())
+        reason = self.assertDenied(self.payload(rows_log))
+        self.assertIn("Grep for what you need, or Read a range", reason)
+        self.assertNotIn("no Read can include it", reason)
 
     def test_offset_only_is_denied(self):
         self.assertDenied(self.payload(self.big_md, offset=300))
