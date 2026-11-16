@@ -87,6 +87,22 @@ Headings are capped at 40, then `... and N more: grep for ^# and read that range
 
 read-guard never writes to any settings file. There is no installer.
 
+## Upgrading
+
+This repository is for development. Claude Code should run only the installed copy at `~/.claude/hooks/read_guard.py`, so an unfinished change in the checkout never runs in your sessions. Every project's settings should point at that file, never at the repository checkout.
+
+After tagging a release (here `v0.2.0`), from the repository root:
+
+```sh
+cp read_guard.py ~/.claude/hooks/read_guard.py
+git show v0.2.0:read_guard.py | cmp - ~/.claude/hooks/read_guard.py
+python3 ~/.claude/hooks/read_guard.py --selftest
+```
+
+`cmp` prints nothing when the installed copy is exactly the tagged release. If it reports a difference, the checkout is not at the tag: check out the tag and copy again.
+
+With one installed copy, a missing file would affect every project. End the hook command with `|| true`, for example `python3 "$HOME/.claude/hooks/read_guard.py" || true`: `python3` exits 2 when it cannot open the script, and Claude Code treats exit code 2 from a `PreToolUse` hook as a block, which would stop every Read.
+
 ## Behavior
 
 The hook reads the PreToolUse payload from stdin and, in order:
