@@ -51,14 +51,15 @@ Headings are capped at 40, then `... and N more: grep for ^# and read that range
 
 ## Install
 
-1. Put the script somewhere stable and check it runs:
+1. Copy the script from a release tag (here `v0.2.0`) to `~/.claude/hooks/`:
 
    ```sh
-   git clone https://github.com/andrewluxem/read-guard
+   git clone --branch v0.2.0 https://github.com/andrewluxem/read-guard
    mkdir -p ~/.claude/hooks
    cp read-guard/read_guard.py ~/.claude/hooks/
-   python3 ~/.claude/hooks/read_guard.py --selftest
    ```
+
+   Then run the `cmp` and `--selftest` checks from [Upgrading](#upgrading) inside `read-guard`.
 
 2. Add the hook by hand to `~/.claude/settings.json` (all projects) or `<project>/.claude/settings.json` (one project). If the file already has a `hooks.PreToolUse` list, add this entry to it rather than replacing it.
 
@@ -71,7 +72,7 @@ Headings are capped at 40, then `... and N more: grep for ^# and read that range
            "hooks": [
              {
                "type": "command",
-               "command": "python3 \"$HOME/.claude/hooks/read_guard.py\"",
+               "command": "python3 \"$HOME/.claude/hooks/read_guard.py\" || true",
                "timeout": 10
              }
            ]
@@ -81,7 +82,7 @@ Headings are capped at 40, then `... and N more: grep for ^# and read that range
    }
    ```
 
-   To run a copy that lives inside the project instead, use `"command": "python3 \"$CLAUDE_PROJECT_DIR/read_guard.py\""`.
+   `|| true` keeps Reads working if the file is ever missing; see [Upgrading](#upgrading). A separate copy inside each project is not recommended: copies drift from the release.
 
 3. Claude Code watches settings files and normally applies hook edits to a running session. Run `/hooks` to confirm the entry is there. If it is not, restart the session.
 
@@ -90,6 +91,8 @@ read-guard never writes to any settings file. There is no installer.
 ## Upgrading
 
 This repository is for development. Claude Code should run only the installed copy at `~/.claude/hooks/read_guard.py`, so an unfinished change in the checkout never runs in your sessions. Every project's settings should point at that file, never at the repository checkout.
+
+The read-guard repository itself is the exception: its own settings run the checkout, so changes can be tried there before tagging.
 
 After tagging a release (here `v0.2.0`), from the repository root:
 
